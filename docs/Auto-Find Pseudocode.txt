@@ -1,0 +1,157 @@
+AUTO-FIND: ABANDONED-ITEM DETECTION AND TRACKING
+
+Auto-Find reads a video, detects people and selected items with YOLOv8m,
+and uses ByteTrack to assign tracking IDs across frames. A finite-state
+machine estimates item ownership from the Euclidean distance between the
+centers of the item and person bounding boxes. The application displays
+tracking results and writes alert images and metadata to the alerts folder.
+
+Algorithm 1. Process the video (main)
+
+INPUT: Video path supplied on the command line, or input.mp4 by default
+OUTPUT: Annotated playback and local abandonment alerts
+
+    Load YOLOv8m and open the video
+    IF the video cannot be opened THEN
+        Print an error and stop
+    END IF
+
+    Read total frame count and integer frames per second (FPS)
+    Use 30 FPS if the reported integer FPS is zero or lower
+    Initialize empty item memory and an empty set of alerted item IDs
+    Set the owner proximity threshold to 150 pixels
+    Set the active abandonment threshold to 10 warning frames
+    Open the playback window and its timeline slider
+    Set playback to running
+
+    WHILE the video and playback window are open DO
+        IF the timeline differs from the video position by over one frame THEN
+            Seek to the selected frame
+        END IF
+
+        IF playback is running THEN
+            Read the next frame and stop the loop if the read fails
+            Detect and track classes 0, 24, 26, and 27 using YOLOv8m
+                and the custom ByteTrack configuration
+            Use image size 640, confidence 0.15, and IoU threshold 0.50
+            Keep ByteTrack state between calls
+            Split tracked detections into people (class 0)
+                and items (classes 24, 26, and 27)
+            Update item memory using Algorithm 2
+
+            FOR each item in memory DO
+                IF its state is ABANDONED and its ID is absent from the alert set THEN
+                    Write alert evidence using Algorithm 3
+                    Add the item ID to the alert set
+                END IF
+            END FOR
+
+            Draw tracking overlays using Algorithm 4
+            Synchronize the timeline with the video position
+            Display the annotated frame
+        ELSE
+            Update the timeline without running detection
+        END IF
+
+        Toggle playback on Space and leave the loop on Q
+    END WHILE
+
+    Release the video and close the playback window
+
+Algorithm 2. Maintain item records and update their states (AutoFindFSM.update)
+
+INPUT: Current item and person detections, and item memory from earlier frames
+OUTPUT: Updated item memory keyed by tracking ID
+
+    Start with an empty set of item IDs encountered in this frame
+
+    FOR each item detection that has a tracking ID DO
+        Compute the center of its bounding box
+        Mark its ID as encountered
+
+        IF this ID has no record THEN
+            Find the first stored item whose ID has yet to be encountered
+                this frame and whose last center is less than 50 pixels away
+            IF such a record exists THEN
+                Move that record to the new ID, preserving its owner,
+                    state, and count of frames alone
+            ELSE
+                Create a record with no owner, state UNVERIFIED,
+                    and zero frames alone
+            END IF
+        END IF
+
+        Store the current center and bounding box in the record
+    END FOR
+
+    FOR each item in memory, including items missing from this frame, DO
+        CASE item state OF
+            UNVERIFIED or IN_TRANSIT:
+                Find the nearest person with a tracking ID
+                IF that person is less than 150 pixels from the item THEN
+                    Assign that person's ID as the owner
+                    Set state to IN_TRANSIT and reset frames alone to zero
+                ELSE IF state is IN_TRANSIT THEN
+                    Set state to WARNING
+                END IF
+
+            WARNING:
+                Find the person whose tracking ID matches the stored owner ID
+                IF that person is present and less than 150 pixels away THEN
+                    Set state to IN_TRANSIT and reset frames alone to zero
+                ELSE
+                    Increment frames alone by one
+                    IF frames alone has reached 10 THEN
+                        Set state to ABANDONED
+                    END IF
+                END IF
+
+            ABANDONED:
+                Keep the item in the ABANDONED state
+        END CASE
+    END FOR
+
+    Return item memory
+
+Algorithm 3. Save alert evidence (trigger_alert)
+
+    Create the alerts folder if needed and generate a timestamp
+    Clip the stored item bounding box to the current frame and extract its crop
+    Save the crop as a timestamped JPEG if it contains pixels
+
+    Find the stored owner ID among the current person detections
+    IF the owner is visible THEN
+        Clip the owner's bounding box to the frame and extract its crop
+        Save the crop as a timestamped JPEG if it contains pixels
+    END IF
+
+    Write a timestamped JSON file with the timestamp, item ID, owner ID,
+        expected item image path, and status pending_vlm_review
+
+Algorithm 4. Annotate the video (draw_overlays and main)
+
+    Draw a green bounding box and tracking ID for each tracked person
+    FOR each item in memory with state IN_TRANSIT, WARNING, or ABANDONED DO
+        Draw its stored box in blue, yellow, or red, respectively
+        Display the item ID, state, and configured class label
+        Use the label Item when there is no matching detection in this frame
+        For WARNING or ABANDONED, display whole seconds from frames alone / FPS
+        For WARNING with a visible owner, draw a line between their centers
+    END FOR
+    Display the current frame, total frames, and video time
+
+Implementation notes
+
+- Startup prints a five-second threshold calculated from the video FPS.
+  The active state machine uses a hard-coded threshold of 10 warning frames.
+  Counting starts on the frame after the transition to WARNING.
+- The nearest person can become the owner on any IN_TRANSIT update. During
+  WARNING, only the stored owner can reset the counter.
+- Alert deduplication uses tracking IDs. A reassigned ID can trigger another
+  alert even if its item record was carried over from an earlier ID.
+- A timeline seek changes the video position while retaining the current
+  tracker state, item memory, and alert history.
+- The current pipeline ends with local files. The pending_vlm_review status
+  marks the alert for a later review stage.
+
+Source files (relative to the project root): project/main.py and project/custom_bytetrack.yaml.
